@@ -707,11 +707,14 @@ pub const AR_CATALOG: &[CatalogedMethod] = &[
         return_kind: Some(ReturnKind::Int),
     },
     CatalogedMethod {
+        // The destroyed records, as `Base.destroy_all` in
+        // `runtime/ruby/active_record/base.rb` answers them, the same
+        // as the relation-side row.
         name: "destroy_all",
         receiver: ReceiverContext::Class,
         effect: EffectClass::DbWrite,
         chain: ChainKind::NotApplicable,
-        return_kind: None,
+        return_kind: Some(ReturnKind::ArrayOfSelf),
     },
     CatalogedMethod {
         name: "delete_all",

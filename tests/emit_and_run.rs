@@ -886,6 +886,85 @@ fn relation_reorder_and_deferred_preloading_run_on_spinel() {
     relation_paging_hooks_app().run_spinel(&script).assert_passes();
 }
 
+/// `Model.destroy_all` on the class, the first line of most generated
+/// seeds, at three call sites: a seeds file, a controller, and a bare call
+/// in a model class method. The controller reads the records it answers,
+/// and the parts go with their widgets, which `delete_all` (no callbacks)
+/// would leave behind.
+fn class_destroy_all_app() -> emit_and_run::Overlay {
+    emit_and_run::empty_app()
+        .write("app/models/application_record.rb", "class ApplicationRecord < ActiveRecord::Base\n  self.abstract_class = true\nend\n")
+        .write("app/controllers/application_controller.rb", "class ApplicationController < ActionController::Base\nend\n")
+        .write("db/schema.rb", r#"ActiveRecord::Schema.define do
+  create_table "widgets", force: :cascade do |t|
+    t.string "name"
+  end
+  create_table "parts", force: :cascade do |t|
+    t.integer "widget_id"
+    t.string "label"
+  end
+end
+"#)
+        .write("app/models/widget.rb", r#"class Widget < ApplicationRecord
+  has_many :parts, dependent: :destroy
+
+  def self.reset
+    destroy_all
+  end
+end
+"#)
+        .write("app/models/part.rb", "class Part < ApplicationRecord\n  belongs_to :widget\nend\n")
+        .write("db/seeds.rb", "Part.destroy_all\nWidget.destroy_all\nWidget.create!(name: \"seeded\")\n")
+        .write("config/routes.rb", "Rails.application.routes.draw do\n  delete \"/widgets\", to: \"widgets#destroy_all\"\n  delete \"/widgets/reset\", to: \"widgets#reset\"\nend\n")
+        .write("app/controllers/widgets_controller.rb", r##"class WidgetsController < ApplicationController
+  def destroy_all
+    destroyed = Widget.destroy_all
+    names = destroyed.map { |widget| widget.name }.sort.join(",")
+    render plain: "#{destroyed.size}:#{names}"
+  end
+
+  def reset
+    render plain: Widget.reset.size.to_s
+  end
+end
+"##)
+}
+
+fn class_destroy_all_assertions() -> &'static str {
+    r#"
+require_relative "app/controllers/widgets_controller"
+beta = Widget.create!(name: "beta")
+Widget.create!(name: "alpha")
+Part.create!(widget_id: beta.id, label: "bolt")
+controller = WidgetsController.new
+controller.process_action(:destroy_all)
+raise "destroy_all answered #{controller.body}" unless controller.body == "2:alpha,beta"
+raise "widgets left: #{Widget.count}" unless Widget.count == 0
+raise "dependent parts left: #{Part.count}" unless Part.count == 0
+Widget.create!(name: "gamma")
+controller = WidgetsController.new
+controller.process_action(:reset)
+raise "reset answered #{controller.body}" unless controller.body == "1"
+raise "widgets left after reset: #{Widget.count}" unless Widget.count == 0
+puts "class destroy_all passed"
+"#
+}
+
+#[test]
+fn class_destroy_all_runs() {
+    class_destroy_all_app().run_ruby(class_destroy_all_assertions()).assert_passes();
+}
+
+#[test]
+#[ignore = "requires the Spinel toolchain"]
+fn class_destroy_all_runs_on_spinel() {
+    let script = format!(
+        "Db.configure(\":memory:\")\nSchema.statements.each {{ |sql| Db.exec(sql) }}\nActiveRecord.adapter = SqliteAdapter\n{}",
+        class_destroy_all_assertions()
+    );
+    class_destroy_all_app().run_spinel(&script).assert_passes();
+}
+
 /// A class method runs against the relation it is reached from: called at
 /// implicit self inside a scope body (basecamp/once-campfire#292's
 /// `scope :last_page, -> { last_page_of(PAGE_SIZE) }`), and called on a
