@@ -8670,3 +8670,106 @@ end
         .run_test("test/models/article_delete_all_test.rb")
         .assert_passes();
 }
+
+/// Script constants remain readable inside seed blocks.
+#[test]
+fn constants_defined_in_seeds_run() {
+    let run = emit_and_run::real_blog()
+        .write(
+            "db/seeds.rb",
+            r#"return if Article.count > 0
+
+DEFAULT_BODY = "A sufficiently long article body."
+TITLES = ["First seeded", "Second seeded"]
+
+TITLES.each do |title|
+  Article.create!(title: title, body: DEFAULT_BODY)
+end
+"#,
+        )
+        .run_ruby(
+            r#"require_relative "db/seeds"
+Seeds.run
+titles = Article.all.map(&:title).sort
+raise "titles: #{titles.inspect}" unless titles == ["First seeded", "Second seeded"]
+raise "body" unless Article.all.all? { |a| a.body == "A sufficiently long article body." }
+puts "seed constants passed"
+"#,
+        );
+    run.assert_passes();
+    assert!(run.stdout.contains("seed constants passed"));
+}
+
+/// The static `db/seed.sql` the non-Ruby archives load evaluates seed
+/// constants bound to scalar literals.
+#[test]
+fn scalar_seed_constants_reach_seed_sql() {
+    let (emitted, errors) = emit_and_run::real_blog()
+        .write(
+            "db/seeds.rb",
+            r#"return if Article.count > 0
+BODY = "A sufficiently long article body."
+article = Article.create!(title: "Seeded", body: BODY)
+article.comments.create!(commenter: "Alice", body: BODY)
+"#,
+        )
+        .emit(roundhouse::project::BuildTarget::Rust);
+    assert!(errors.is_empty(), "{errors:?}");
+    let sql = std::fs::read_to_string(emitted.join("db/seed.sql")).expect("emitted db/seed.sql");
+    assert!(sql.contains("VALUES (1,'Seeded','A sufficiently long article body.'"), "{sql}");
+    assert!(sql.contains("VALUES (1,1,'Alice','A sufficiently long article body.'"), "{sql}");
+}
+
+/// Conditional constant definitions retain their unsupported diagnostic.
+#[test]
+fn conditional_seed_constant_still_reports() {
+    let (_, errors) = emit_and_run::real_blog()
+        .write(
+            "db/seeds.rb",
+            r#"if Article.count > 100
+  EXTRA = "only when many"
+end
+puts EXTRA
+"#,
+        )
+        .emit(roundhouse::project::BuildTarget::Ruby);
+    assert!(
+        errors.iter().any(|e| e.contains("constant not supported") && e.contains("EXTRA")),
+        "{errors:?}",
+    );
+}
+
+#[test]
+fn seed_constant_locals_do_not_collide() {
+    emit_and_run::real_blog()
+        .write(
+            "db/seeds.rb",
+            r#"return if Article.count > 0
+body = "Original local body."
+body_const = "Original suffixed local body."
+BODY = "Constant body content."
+FOO = "Uppercase constant body."
+Foo = "Mixed case constant body."
+Article.create!(title: "local", body: body)
+Article.create!(title: "suffixed", body: body_const)
+Article.create!(title: "constant", body: BODY)
+Article.create!(title: "uppercase", body: FOO)
+Article.create!(title: "mixed", body: Foo)
+"#,
+        )
+        .run_ruby(
+            r#"require_relative "db/seeds"
+Seeds.run
+expected = {
+  "local" => "Original local body.",
+  "suffixed" => "Original suffixed local body.",
+  "constant" => "Constant body content.",
+  "uppercase" => "Uppercase constant body.",
+  "mixed" => "Mixed case constant body."
+}
+actual = Article.all.map { |article| [article.title, article.body] }.to_h
+raise "rows: #{actual.inspect}" unless actual == expected
+"#,
+        )
+        .assert_passes();
+}

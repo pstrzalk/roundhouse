@@ -1781,12 +1781,12 @@ impl Analyzer {
         };
         // (defining class, last-segment name, Rubydex ID, value,
         // eligible for the production generated-expression fallback).
-        let mut entries: Vec<(Ty, Symbol, Option<DeclarationId>, Expr, bool)> = Vec::new();
+        let mut entries: Vec<(Option<Ty>, Symbol, Option<DeclarationId>, Expr, bool)> = Vec::new();
         let mut push_const = |self_ty: Ty, expr: &Expr| {
             if let ExprNode::Assign { target: LValue::Const { path }, value } = &*expr.node {
                 if let Some(last) = path.last() {
                     let id = declaration_id(last, value);
-                    entries.push((self_ty, last.clone(), id, value.clone(), true));
+                    entries.push((Some(self_ty), last.clone(), id, value.clone(), true));
                 }
             }
         };
@@ -1818,7 +1818,7 @@ impl Analyzer {
         for lc in &app.library_classes {
             for (name, value) in &lc.constants {
                 let self_ty = Ty::Class { id: lc.name.clone(), args: vec![] };
-                entries.push((self_ty, name.clone(), declaration_id(name, value), value.clone(), true));
+                entries.push((Some(self_ty), name.clone(), declaration_id(name, value), value.clone(), true));
             }
         }
         // Original source tests use the same DeclarationId contract.
@@ -1830,8 +1830,16 @@ impl Analyzer {
             {
                 for (name, value) in constants {
                     let self_ty = Ty::Class { id: owner.clone(), args: vec![] };
-                    entries.push((self_ty, name.clone(), declaration_id(name, value), value.clone(), false));
+                    entries.push((Some(self_ty), name.clone(), declaration_id(name, value), value.clone(), false));
                 }
+            }
+        }
+        // Seed constants participate by DeclarationId, without a class owner.
+        // Keep them out of the production view fallback: Roundhouse models
+        // these constants as private to the seed script.
+        if let Some(seeds) = &app.seeds {
+            for (name, value) in crate::lower::seeds_to_library::seed_constant_writes(seeds) {
+                entries.push((None, name.clone(), declaration_id(name, value), value.clone(), false));
             }
         }
 
@@ -1854,7 +1862,7 @@ impl Analyzer {
             let typer = if self.source_indexed { typer.with_const_resolver(self.const_resolver.clone()) } else { typer };
             for (self_ty, name, id, value, production) in entries.iter_mut() {
                 let ctx = Ctx {
-                    self_ty: Some(self_ty.clone()),
+                    self_ty: self_ty.clone(),
                     ivar_bindings: HashMap::new(),
                     local_bindings: HashMap::new(),
                     class_objects: Default::default(),

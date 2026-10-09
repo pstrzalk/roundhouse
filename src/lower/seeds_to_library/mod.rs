@@ -1,40 +1,26 @@
-//! Lower `app.seeds` (the typed `db/seeds.rb` Expr) into a `Seeds`
-//! LibraryClass with a single class method `run()`. The body is the
-//! seeds Expr verbatim — analyze has already attached types and
-//! effects, so the walker emits `Article.create!(...)`, etc., the
-//! same way it would in a controller body.
+//! Lower typed seeds into `Seeds.run`, sharing the body with `db/seed.sql`.
 //!
-//! Self-describing IR: the seeds body's typing was set during
-//! analyze (DbWrite on `create!`, etc.). The lowerer just wraps it
-//! in a MethodDef shell — no per-target string-shape decisions.
-//!
-//! ONE IR rewrite happens here: Rails' has-many `create` shorthand
-//! (`article.comments.create!(...)`) gets de-magic'd into the
-//! explicit `Comment.create!(article_id: article.id, ...)` form
-//! that targets without CollectionProxy semantics can dispatch.
-//! The Ruby source stays Rails-idiomatic; the lowerer translates.
-//! Mirrors `rewrite_assoc_through_parent_typed` in the controller
-//! lowerer (which handles `build`/`find` for assignment-shape
-//! contexts) — seeds are statement-shape so this pass only handles
-//! the `create` form on its own.
+//! Association creates become explicit model creates with foreign keys.
+//! Script constants become locals: Ruby rejects constant assignments inside
+//! methods. Roundhouse models these constants as private to the seed script.
 
 use crate::App;
 use crate::dialect::LibraryFunction;
 use crate::effect::EffectSet;
-use crate::expr::{Expr, ExprNode};
-use crate::ident::Symbol;
+use crate::expr::{Expr, ExprNode, LValue, Literal};
+use crate::ident::{Symbol, VarId};
 use crate::lower::typing::fn_sig;
 use crate::span::Span;
 use crate::ty::Ty;
 
 /// Build the `Seeds` module as a single LibraryFunction:
-/// `Seeds.run() -> nil` carrying the typed seeds Expr from
-/// `app.seeds` verbatim. Empty when the app has no seeds file.
+/// `Seeds.run() -> nil` carrying the lowered seeds body.
+/// Empty when the app has no seeds file.
 pub fn lower_seeds_to_library_functions(app: &App) -> Vec<LibraryFunction> {
     let Some(body) = app.seeds.as_ref().cloned() else {
         return Vec::new();
     };
-    let body = rewrite_assoc_create(&body);
+    let body = lower_seeds_body(&body);
     let module_path = vec![Symbol::from("Seeds")];
     vec![LibraryFunction {
         module_path,
@@ -47,6 +33,96 @@ pub fn lower_seeds_to_library_functions(app: &App) -> Vec<LibraryFunction> {
         effects: EffectSet::default(),
         is_async: false,
     }]
+}
+
+/// The seeds body every consumer works from: `Seeds.run` and the
+/// static `db/seed.sql` evaluate the same lowered form.
+pub fn lower_seeds_body(seeds: &Expr) -> Expr {
+    seed_constants_to_locals(&rewrite_assoc_create(seeds))
+}
+
+/// Collect unconditional script constant writes in source order.
+/// Conditional definitions stay unsupported: a skipped local assignment
+/// would read `nil` where an undefined Ruby constant raises NameError.
+pub fn seed_constant_writes(seeds: &Expr) -> Vec<(&Symbol, &Expr)> {
+    fn walk<'a>(e: &'a Expr, out: &mut Vec<(&'a Symbol, &'a Expr)>) {
+        match &*e.node {
+            ExprNode::Seq { exprs } => exprs.iter().for_each(|e| walk(e, out)),
+            // `return if COND` + rest ingests to a synthetic
+            // `if COND then nil else rest end` (`detect_leading_guard`).
+            ExprNode::If { then_branch, else_branch, .. }
+                if e.span.is_synthetic()
+                    && matches!(&*then_branch.node, ExprNode::Lit { value: Literal::Nil }) =>
+            {
+                walk(else_branch, out);
+            }
+            ExprNode::Assign { target: LValue::Const { path }, value } if path.len() == 1 => {
+                out.push((&path[0], value));
+            }
+            _ => {}
+        }
+    }
+    let mut out = Vec::new();
+    walk(seeds, &mut out);
+    out
+}
+
+/// Rewrite script constants to distinct locals, preserving analyzed types.
+fn seed_constants_to_locals(seeds: &Expr) -> Expr {
+    let consts = seed_constant_writes(seeds);
+    if consts.is_empty() {
+        return seeds.clone();
+    }
+    let mut used = std::collections::HashSet::new();
+    collect_local_names(seeds, &mut used);
+    let mut locals = std::collections::HashMap::new();
+    // Allocate in source order, reserving generated names as well as source locals.
+    for (name, _) in consts {
+        if locals.contains_key(name) {
+            continue;
+        }
+        let mut local = crate::naming::snake_case(name.as_str());
+        while !used.insert(local.clone()) {
+            local.push_str("_const");
+        }
+        locals.insert(name.clone(), Symbol::from(local));
+    }
+    fn rewrite(e: &mut Expr, locals: &std::collections::HashMap<Symbol, Symbol>) {
+        let replacement = match &mut *e.node {
+            ExprNode::Const { path } if path.len() == 1 && locals.contains_key(&path[0]) => {
+                Some(ExprNode::Var { id: VarId(0), name: locals[&path[0]].clone() })
+            }
+            ExprNode::Assign { target, .. } => {
+                if let LValue::Const { path } = target {
+                    if path.len() == 1 && locals.contains_key(&path[0]) {
+                        *target = LValue::Var { id: VarId(0), name: locals[&path[0]].clone() };
+                    }
+                }
+                None
+            }
+            _ => None,
+        };
+        if let Some(node) = replacement {
+            *e.node = node;
+        }
+        e.node.for_each_child_mut(&mut |c| rewrite(c, locals));
+    }
+    let mut out = seeds.clone();
+    rewrite(&mut out, &locals);
+    out
+}
+
+fn collect_local_names(e: &Expr, out: &mut std::collections::HashSet<String>) {
+    match &*e.node {
+        ExprNode::Var { name, .. } | ExprNode::Assign { target: LValue::Var { name, .. }, .. } => {
+            out.insert(name.as_str().to_string());
+        }
+        ExprNode::Lambda { params, .. } => {
+            out.extend(params.iter().map(|p| p.as_str().to_string()));
+        }
+        _ => {}
+    }
+    e.node.for_each_child(&mut |c| collect_local_names(c, out));
 }
 
 /// `<parent>.<assoc>.create(<args>)` → `<AssocClass>.create(<parent_class>_id: <parent>.id, ...args)`.

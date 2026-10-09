@@ -27,6 +27,8 @@
 //! return if Article.count > 0            # guard — skipped
 //! a = Article.create!(title: "…")        # INSERT, binds `a` to its id
 //! Comment.create!(article_id: a.id, …)   # INSERT, resolves `a.id`
+//! BODY = "…"                             # a scalar literal, read by
+//! Article.create!(body: BODY)            #   later INSERTs
 //! puts "…"                               # ignored
 //! ```
 //!
@@ -108,7 +110,7 @@ pub fn render_seed_sql(app: &App) -> Option<String> {
     // (`article.comments.create!(…)` → `Comment.create!(article_id:
     // article.id, …)`) on the way out and leaves `app.seeds` untouched.
     // Interpreting the raw form would decline on every association row.
-    let seeds = crate::lower::seeds_to_library::rewrite_assoc_create(app.seeds.as_ref()?);
+    let seeds = crate::lower::seeds_to_library::lower_seeds_body(app.seeds.as_ref()?);
     let inserts = Interp::new(&app.schema, &app.models).run(&seeds)?;
     if inserts.is_empty() {
         return None;
@@ -149,6 +151,9 @@ struct Interp<'s> {
     /// Next id per table, 1-indexed like AUTOINCREMENT.
     next_id: std::collections::HashMap<String, i64>,
     bindings: Vec<Binding>,
+    /// Locals bound to a scalar literal, as the SQL literal. Seeds
+    /// constants arrive here as locals (`lower_seeds_body`).
+    literals: std::collections::HashMap<String, String>,
     /// Microseconds past `SEED_EPOCH` for the next row.
     tick: i64,
     out: Vec<String>,
@@ -161,6 +166,7 @@ impl<'s> Interp<'s> {
             models,
             next_id: std::collections::HashMap::new(),
             bindings: Vec::new(),
+            literals: std::collections::HashMap::new(),
             tick: 0,
             out: Vec::new(),
         }
@@ -190,8 +196,17 @@ impl<'s> Interp<'s> {
                 // depend on runtime state. Decline.
                 None
             }
+            // `body = "…"` — a scalar later INSERTs read.
+            ExprNode::Assign { target: LValue::Var { name, .. }, value }
+                if matches!(&*value.node, ExprNode::Lit { .. }) =>
+            {
+                let sql = self.value(value)?;
+                self.literals.insert(name.as_str().to_string(), sql);
+                Some(())
+            }
             // `a = Model.create!(…)` — insert, then bind the id.
             ExprNode::Assign { target: LValue::Var { name, .. }, value } => {
+                self.literals.remove(name.as_str());
                 let id = self.insert(value)?;
                 self.bindings.push(Binding { name: name.as_str().to_string(), id });
                 Some(())
@@ -268,7 +283,8 @@ impl<'s> Interp<'s> {
         Some(id)
     }
 
-    /// A literal, or `<local>.id` for a row created earlier.
+    /// A literal, a local bound to one, or `<local>.id` for a row
+    /// created earlier.
     fn value(&self, e: &Expr) -> Option<String> {
         match &*e.node {
             ExprNode::Lit { value } => match value {
@@ -291,6 +307,7 @@ impl<'s> Interp<'s> {
                     .find(|b| b.name == name.as_str())?;
                 Some(b.id.to_string())
             }
+            ExprNode::Var { name, .. } => self.literals.get(name.as_str()).cloned(),
             _ => None,
         }
     }
