@@ -405,14 +405,24 @@ populated"). No special dialect wrapping; it's just Ruby in IR form.
 
 **Analyze:** the body is typed against the model registry exactly
 as any controller body — `Article.create!(...)` binds its argument
-types from the `Article` class's attribute row.
+types from the `Article` class's attribute row. Constants the file
+defines at statement level (`TITLES = [...]`) join the constant
+value fixpoint (`build_constant_registry`) by Rubydex declaration,
+but not the bare-name fallback views use.
 
 **Lowered to LibraryFunction:** `src/lower/seeds_to_library/`
 produces one `LibraryFunction` — `Seeds.run() -> nil` under
-`module_path: ["Seeds"]`. The body is the seeds Expr verbatim;
-analyze has already attached types and effects, so the walker
-emits `Article.create!(...)` etc. the same way it would in any
-other class context.
+`module_path: ["Seeds"]`. The body is the seeds Expr after
+`lower_seeds_body`: the has-many `create` de-magic, and seed
+constants rewritten to locals of `run` (`TITLES` → `titles`), since
+Ruby rejects constant assignments inside methods. Roundhouse models
+these constants as private to the seed script. Analyze has
+already attached types and effects, so the walker emits
+`Article.create!(...)` etc. the same way it would in any other
+class context. `db/seed.sql` evaluates the same lowered body;
+locals bound to scalar literals feed its INSERTs, and anything
+else it cannot evaluate (a loop, a computed value) falls back to a
+schema-only file.
 
 **Per-target emit:** TS writes `db/seeds.ts` with `export function
 run()` plus the namespace const. `main.ts` passes `() =>
@@ -422,6 +432,10 @@ runtime invokes it on first boot when the DB is empty.
 **Known shape limits.** No special handling today for `Rails.env`
 gates or `unless` guards on seed records — whatever Ruby the file
 contains is ingested as-is and the analyzer sorts out the types.
+A constant written anywhere other than statement level (inside a
+block, a `def` or an `if`) is not collected, so its reads still report
+`constant not supported`. As a local, a skipped conditional write
+would read `nil` where Ruby raises NameError.
 
 ## `config/importmap.rb` → `Importmap` → `Importmap.{pins, entry}`
 
